@@ -1,1 +1,22 @@
+# Secrets - NEVER commit this
 .env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# IDE
+.vscode/
+.idea/
+
+# Output/logs
+*.log
+output/
