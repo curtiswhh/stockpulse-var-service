@@ -42,7 +42,11 @@ class DailyPipeline:
 
         # ── Step 1: Refresh S&P 500 list ──────────────────────
         logger.info("Step 1/5: Refreshing S&P 500 constituents...")
-        diff = await self.sp500.refresh()
+        try:
+            diff = await self.sp500.refresh()
+        except Exception as e:
+            logger.warning(f"  S&P 500 refresh failed (non-fatal): {e}")
+            diff = {"added": [], "removed": [], "total": 0}
 
         # ── Step 2: Resolve which tickers to process ──────────
         tickers = self._resolve_tickers(diff["added"])
