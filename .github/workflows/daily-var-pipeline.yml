@@ -3,7 +3,7 @@ name: Daily VaR Pipeline
 on:
   schedule:
     # Mon-Fri at 21:30 UTC (after US market close)
-    - cron: '30 21 * * 1-5'
+    - cron: '0 1 * * 2-6'
 
   # Allow manual trigger from GitHub UI (Actions tab -> Run workflow)
   workflow_dispatch:
