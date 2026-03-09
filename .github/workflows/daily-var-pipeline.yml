@@ -2,8 +2,10 @@ name: Daily VaR Pipeline
 
 on:
   schedule:
-    # Mon-Fri at 21:30 UTC (after US market close)
-    - cron: '0 1 * * 2-6'
+    # Run 1: Mon-Fri at 21:30 UTC (just after US market close)
+    - cron: '30 21 * * 1-5'
+    # Run 2: Tue-Sat at 05:00 UTC (next morning, gives Polygon more time to publish EOD data)
+    - cron: '0 5 * * 2-6'
 
   # Allow manual trigger from GitHub UI (Actions tab -> Run workflow)
   workflow_dispatch:
