@@ -1,10 +1,23 @@
 """
-Configuration — TEST MODE version (AAPL-only, 1000 days).
+Configuration — settings for StockPulse VaR pipeline.
+========================================================
 
-Changes from previous version:
-  - test_tickers reduced to AAPL only
-  - var_max_lookback_days set to 1000
-  - Single confidence level (0.95) and single lookback (252) for simple VaR
+SEED_TICKERS vs PRICE_HISTORY:
+  seed_tickers is a convenience list for standalone testing and cold-start
+  seeding only. It is NOT used by the daily pipeline or any CLI command.
+
+  The daily pipeline and all "--all" CLI commands resolve tickers by
+  querying SELECT DISTINCT ticker FROM price_history in Supabase.
+  If a ticker has price data, it gets processed automatically.
+
+  You can use seed_tickers for quick local testing like:
+    for t in settings.seed_tickers:
+        await backfill.fetch_and_compute_var(t)
+
+TEST_MODE vs PRODUCTION:
+  TEST_MODE=true  → daily pipeline processes only tickers in price_history
+  TEST_MODE=false → daily pipeline merges price_history + all active S&P 500
+                     (so newly added S&P 500 stocks get backfilled automatically)
 """
 
 import os
@@ -30,14 +43,16 @@ class Settings:
     polygon_api_key: str = field(default_factory=lambda: os.environ["POLYGON_API_KEY"])
 
     # ══════════════════════════════════════════════════════════
-    # TEST MODE CONTROLS
+    # TEST / PRODUCTION MODE
     # ══════════════════════════════════════════════════════════
     test_mode: bool = field(
         default_factory=lambda: os.environ.get("TEST_MODE", "true").lower() == "true"
     )
 
-    # AAPL only for focused testing
-    test_tickers: tuple = ("AAPL",)
+    # Convenience list for standalone testing / cold-start seeding.
+    # NOT used by the daily pipeline or CLI commands.
+    # The pipeline resolves tickers from price_history instead.
+    seed_tickers: tuple = ("AAPL", "TSLA")
 
     # ── VaR Parameters ────────────────────────────────────────
     # Simple percentile VaR settings
@@ -78,10 +93,11 @@ class Settings:
 
     def describe(self) -> str:
         mode = "TEST" if self.test_mode else "PRODUCTION"
-        tickers = list(self.test_tickers) if self.test_mode else "all S&P 500"
         return (
             f"── Settings ({mode} MODE) ──\n"
-            f"  Tickers:            {tickers}\n"
+            f"  Mode:               {mode}\n"
+            f"  Seed tickers:       {list(self.seed_tickers)} (for standalone testing only)\n"
+            f"  Ticker resolution:  All distinct tickers in price_history\n"
             f"  Backfill days:      {self.var_max_backfill_days}\n"
             f"  VaR confidence:     {self.var_confidence_level}\n"
             f"  VaR lookback:       {self.var_lookback_days} trading days\n"

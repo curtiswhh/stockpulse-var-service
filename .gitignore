@@ -20,3 +20,4 @@ __MACOSX/
 # Output/logs
 *.log
 output/
+__pycache__/

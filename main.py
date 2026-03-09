@@ -1,13 +1,30 @@
 """
-StockPulse Backend — TEST MODE Entry Point (AAPL-only)
+StockPulse Backend — Entry Point
 ========================================================
-Usage:
-    python main.py --initial-backfill       ← fetch prices from Polygon + compute rolling VaR
-    python main.py --backfill AAPL          ← backfill a single ticker (fetch + VaR)
-    python main.py --compute-var            ← recompute VaR from existing Supabase data (no Polygon)
-    python main.py --run-daily              ← run the full daily pipeline
-    python main.py --refresh-sp500          ← refresh S&P 500 list
-    python main.py --describe               ← show current config
+
+CLI COMMANDS (quick reference):
+─────────────────────────────────────────────────────────────────────────────
+  python main.py --run-daily                     ← Full daily pipeline (Polygon fetch + VaR) for all tickers in price_history
+  python main.py --fetch-and-compute-var TSLA    ← Polygon fetch + VaR for ONE ticker
+  python main.py --fetch-and-compute-var-all     ← Polygon fetch + VaR for ALL tickers in price_history
+  python main.py --compute-var TSLA              ← VaR only for ONE ticker (NO Polygon calls)
+  python main.py --compute-var-all               ← VaR only for ALL tickers in price_history (NO Polygon calls)
+  python main.py --refresh-sp500                 ← Refresh S&P 500 constituent list only
+  python main.py --describe                      ← Print current config and exit
+─────────────────────────────────────────────────────────────────────────────
+
+TICKER RESOLUTION:
+  All commands that process "all tickers" resolve them by querying
+  SELECT DISTINCT ticker FROM price_history in Supabase.
+  This means: if a ticker has rows in price_history, it gets processed.
+  No hardcoded config needed.
+
+  The seed_tickers in settings.py is ONLY for standalone testing /
+  cold-start seeding. The daily pipeline and CLI commands ignore it.
+
+POLYGON API:
+  Commands with "fetch" in the name call Polygon for price data.
+  Commands without "fetch" work purely from existing Supabase data.
 """
 
 import argparse
@@ -31,14 +48,55 @@ logger = logging.getLogger("stockpulse")
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="StockPulse VaR Pipeline (Test Mode)")
+    parser = argparse.ArgumentParser(
+        description="StockPulse VaR Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+            Examples:
+            python main.py --run-daily                     # Daily cron job
+            python main.py --fetch-and-compute-var TSLA    # Add a new ticker end-to-end
+            python main.py --compute-var TSLA              # Recompute VaR after manual price upload
+            python main.py --compute-var-all               # Recompute VaR for everything in price_history
+                    """,
+    )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--run-daily", action="store_true", help="Run the full daily pipeline")
-    group.add_argument("--backfill", type=str, metavar="TICKER", help="Backfill a single ticker")
-    group.add_argument("--refresh-sp500", action="store_true", help="Refresh S&P 500 list only")
-    group.add_argument("--initial-backfill", action="store_true", help="Backfill all tickers (fetch + VaR)")
-    group.add_argument("--compute-var", action="store_true", help="Recompute VaR from existing Supabase price data (no Polygon calls)")
-    group.add_argument("--describe", action="store_true", help="Print current config and exit")
+
+    # ── Full daily pipeline ───────────────────────────────────
+    group.add_argument(
+        "--run-daily", action="store_true",
+        help="Full daily pipeline: Polygon fetch + VaR for all tickers in price_history",
+    )
+
+    # ── Polygon fetch + VaR (calls Polygon API) ──────────────
+    group.add_argument(
+        "--fetch-and-compute-var", type=str, metavar="TICKER",
+        help="Fetch prices from Polygon + compute VaR for ONE ticker",
+    )
+    group.add_argument(
+        "--fetch-and-compute-var-all", action="store_true",
+        help="Fetch prices from Polygon + compute VaR for ALL tickers in price_history",
+    )
+
+    # ── VaR only (NO Polygon calls) ──────────────────────────
+    group.add_argument(
+        "--compute-var", type=str, metavar="TICKER",
+        help="Compute VaR for ONE ticker from existing Supabase data (no Polygon)",
+    )
+    group.add_argument(
+        "--compute-var-all", action="store_true",
+        help="Compute VaR for ALL tickers in price_history (no Polygon)",
+    )
+
+    # ── Utilities ─────────────────────────────────────────────
+    group.add_argument(
+        "--refresh-sp500", action="store_true",
+        help="Refresh S&P 500 constituent list only",
+    )
+    group.add_argument(
+        "--describe", action="store_true",
+        help="Print current config and exit",
+    )
+
     args = parser.parse_args()
 
     settings = Settings()
@@ -62,16 +120,32 @@ async def main():
         var_engine=var_engine, settings=settings,
     )
 
+    # ── Route to the correct action ──────────────────────────
     if args.run_daily:
+        # Full daily pipeline: resolves tickers from price_history,
+        # fetches latest prices from Polygon, computes VaR
         await pipeline.run()
-    elif args.backfill:
-        await backfill.backfill_ticker(args.backfill)
+
+    elif args.fetch_and_compute_var:
+        # Polygon fetch + VaR for a single ticker
+        # Use this to add a brand new ticker end-to-end
+        await backfill.fetch_and_compute_var(args.fetch_and_compute_var)
+
+    elif args.fetch_and_compute_var_all:
+        # Polygon fetch + VaR for every ticker in price_history
+        await backfill.fetch_and_compute_var_all()
+
+    elif args.compute_var:
+        # VaR only for one ticker — no Polygon calls
+        # Use this after manually uploading prices to Supabase
+        await backfill.compute_var(args.compute_var)
+
+    elif args.compute_var_all:
+        # VaR only for every ticker in price_history — no Polygon calls
+        await backfill.compute_var_all()
+
     elif args.refresh_sp500:
         await sp500.refresh()
-    elif args.initial_backfill:
-        await backfill.full_backfill()
-    elif args.compute_var:
-        await backfill.compute_var_all()
 
     logger.info("Done.")
 

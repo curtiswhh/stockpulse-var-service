@@ -1,12 +1,18 @@
 """
-Backfill Job — updated for rolling daily VaR.
+Backfill Job — Polygon fetch and VaR computation.
+========================================================
 
-Steps per ticker:
-  1. Fetch price data from Polygon (1000 days)
-  2. Upsert into price_history
-  3. Read back full price history from Supabase
-  4. Compute rolling daily VaR (simple percentile)
-  5. Upsert results into var_calculations_precomputed
+METHOD NAMING CONVENTION:
+  fetch_and_compute_var_*  → calls Polygon API for prices, THEN computes VaR
+  compute_var_*            → computes VaR ONLY from existing Supabase data (NO Polygon)
+
+TICKER RESOLUTION:
+  Methods ending in "_all" resolve tickers by querying all distinct tickers
+  in the price_history table. This means any ticker you've uploaded price
+  data for will automatically be included — no config changes needed.
+
+  The seed_tickers in settings.py are NOT used here. They exist only for
+  standalone testing / cold-start seeding and are separate from these commands.
 """
 
 import logging
@@ -27,9 +33,23 @@ class BackfillJob:
         self.var_engine = var_engine
         self.settings = settings
 
-    async def backfill_ticker(self, ticker: str):
-        """Fetch prices from Polygon, upsert, then compute and store rolling VaR."""
-        logger.info(f"Backfilling {ticker}...")
+    # ══════════════════════════════════════════════════════════
+    # FETCH + COMPUTE VAR (calls Polygon API)
+    # ══════════════════════════════════════════════════════════
+
+    async def fetch_and_compute_var(self, ticker: str):
+        """
+        Fetch prices from Polygon + compute VaR for ONE ticker.
+        CLI: python main.py --fetch-and-compute-var TSLA
+
+        Steps:
+          1. Fetch ~1000 days of daily bars from Polygon API
+          2. Upsert into price_history in Supabase
+          3. Read back full price history from Supabase
+          4. Compute rolling daily VaR
+          5. Upsert results into var_calculations_precomputed
+        """
+        logger.info(f"[fetch-and-compute-var] {ticker}: starting...")
         today = date.today()
         earliest_needed = today - timedelta(days=self.settings.var_max_backfill_days + 30)
         latest_in_db = self.supabase.get_latest_price_date(ticker)
@@ -39,7 +59,7 @@ class BackfillJob:
             logger.info(f"  {ticker}: filling gap from {from_date}")
         else:
             from_date = earliest_needed
-            logger.info(f"  {ticker}: full backfill from {from_date}")
+            logger.info(f"  {ticker}: full fetch from {from_date}")
 
         # ── Step 1: Fetch price data from Polygon in yearly chunks ──
         current_start = from_date
@@ -53,18 +73,46 @@ class BackfillJob:
         # ── Step 2: Upsert price data ──
         if all_bars:
             self.supabase.upsert_price_history(all_bars)
-            logger.info(f"  {ticker}: loaded {len(all_bars)} daily bars")
+            logger.info(f"  {ticker}: loaded {len(all_bars)} daily bars from Polygon")
         else:
             logger.warning(f"  {ticker}: no data returned from Polygon")
             return
 
-        # ── Step 3–5: Compute and store VaR ──
-        await self.compute_var_ticker(ticker)
+        # ── Steps 3-5: Compute and store VaR ──
+        await self.compute_var(ticker)
 
-    async def compute_var_ticker(self, ticker: str):
-        """Read prices from Supabase, compute rolling VaR, write back results.
-        No Polygon calls — works purely from data already in Supabase."""
-        logger.info(f"Computing rolling VaR for {ticker}...")
+    async def fetch_and_compute_var_all(self):
+        """
+        Fetch prices from Polygon + compute VaR for ALL tickers in price_history.
+        CLI: python main.py --fetch-and-compute-var-all
+
+        Resolves tickers from: SELECT DISTINCT ticker FROM price_history
+        """
+        tickers = self.supabase.get_all_price_history_tickers()
+        logger.info(f"[fetch-and-compute-var-all] Processing {len(tickers)} tickers from price_history: {tickers}")
+
+        for i, ticker in enumerate(tickers):
+            logger.info(f"[{i+1}/{len(tickers)}] {ticker}")
+            await self.fetch_and_compute_var(ticker)
+
+        logger.info(f"Fetch + VaR complete — {len(tickers)} tickers processed.")
+
+    # ══════════════════════════════════════════════════════════
+    # COMPUTE VAR ONLY (NO Polygon calls)
+    # ══════════════════════════════════════════════════════════
+
+    async def compute_var(self, ticker: str):
+        """
+        Compute VaR for ONE ticker from existing Supabase price data.
+        CLI: python main.py --compute-var TSLA
+
+        No Polygon calls — works purely from data already in price_history.
+        Use this after you've manually uploaded prices to Supabase.
+
+        Requires at least 254 rows (252 lookback + 2) in price_history
+        for the ticker, otherwise VaR cannot be computed.
+        """
+        logger.info(f"[compute-var] {ticker}: computing rolling VaR...")
 
         # Read full price history from Supabase
         prices = self.supabase.get_full_price_history(ticker)
@@ -90,33 +138,18 @@ class BackfillJob:
             logger.info(f"  {ticker}: upserted {len(var_rows)} VaR rows")
 
     async def compute_var_all(self):
-        """Compute rolling VaR for all configured tickers using existing Supabase data."""
-        if self.settings.test_mode:
-            tickers = list(self.settings.test_tickers)
-            logger.info(f"TEST MODE: computing VaR for {len(tickers)} tickers")
-        else:
-            rows = self.supabase.get_sp500_tickers()
-            tickers = [r["ticker"] for r in rows if r.get("is_active", True)]
-            logger.info(f"PRODUCTION: computing VaR for {len(tickers)} tickers")
+        """
+        Compute VaR for ALL tickers that have price data in Supabase.
+        CLI: python main.py --compute-var-all
+
+        No Polygon calls — works purely from existing data.
+        Resolves tickers from: SELECT DISTINCT ticker FROM price_history
+        """
+        tickers = self.supabase.get_all_price_history_tickers()
+        logger.info(f"[compute-var-all] Processing {len(tickers)} tickers from price_history: {tickers}")
 
         for i, ticker in enumerate(tickers):
             logger.info(f"[{i+1}/{len(tickers)}] {ticker}")
-            await self.compute_var_ticker(ticker)
+            await self.compute_var(ticker)
 
         logger.info(f"VaR computation complete — {len(tickers)} tickers processed.")
-
-    async def full_backfill(self):
-        """In test mode this only backfills the test tickers."""
-        if self.settings.test_mode:
-            tickers = list(self.settings.test_tickers)
-            logger.info(f"TEST MODE: backfilling {len(tickers)} test tickers only")
-        else:
-            rows = self.supabase.get_sp500_tickers()
-            tickers = [r["ticker"] for r in rows if r.get("is_active", True)]
-            logger.info(f"PRODUCTION: backfilling {len(tickers)} tickers")
-
-        for i, ticker in enumerate(tickers):
-            logger.info(f"[{i+1}/{len(tickers)}] {ticker}")
-            await self.backfill_ticker(ticker)
-
-        logger.info(f"Backfill complete — {len(tickers)} tickers processed.")

@@ -1,5 +1,12 @@
 """
 Supabase client — thin wrapper around supabase-py.
+========================================================
+
+KEY METHOD FOR TICKER RESOLUTION:
+  get_all_price_history_tickers() → returns all distinct tickers in price_history.
+  This is the primary way the daily pipeline and CLI commands determine
+  which stocks to process. If a ticker has rows in price_history, it's included.
+
 Updated: date→business_date, calc_date→business_date, no id columns.
 """
 
@@ -44,6 +51,40 @@ class SupabaseClient:
         logger.info(f"Marked {len(removed_tickers)} tickers as removed")
 
     # ── Price History ─────────────────────────────────────────
+
+    def get_all_price_history_tickers(self) -> list[str]:
+        """
+        Return all distinct tickers that have data in price_history.
+
+        THIS IS THE PRIMARY TICKER RESOLUTION METHOD.
+        The daily pipeline and CLI "--all" commands use this to determine
+        which stocks to process. If a ticker has rows here, it gets included.
+
+        Uses pagination to handle tables with more than 1000 rows,
+        since Supabase caps responses at 1000 per request.
+        """
+        all_tickers: set[str] = set()
+        page_size = 1000
+        offset = 0
+
+        while True:
+            resp = (
+                self._client.table("price_history")
+                .select("ticker")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            if not resp.data:
+                break
+            for row in resp.data:
+                all_tickers.add(row["ticker"])
+            if len(resp.data) < page_size:
+                break
+            offset += page_size
+
+        result = sorted(all_tickers)
+        logger.info(f"Found {len(result)} distinct tickers in price_history: {result}")
+        return result
 
     def get_latest_price_date(self, ticker: str) -> date | None:
         resp = (
