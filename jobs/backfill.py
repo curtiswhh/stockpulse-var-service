@@ -27,11 +27,12 @@ logger = logging.getLogger(__name__)
 
 
 class BackfillJob:
-    def __init__(self, supabase, polygon, var_engine, settings):
+    def __init__(self, supabase, polygon, var_engine, settings, correlation_engine=None):
         self.supabase = supabase
         self.polygon = polygon
         self.var_engine = var_engine
         self.settings = settings
+        self.correlation_engine = correlation_engine
 
     # ══════════════════════════════════════════════════════════
     # FETCH + COMPUTE VAR (calls Polygon API)
@@ -153,3 +154,54 @@ class BackfillJob:
             await self.compute_var(ticker)
 
         logger.info(f"VaR computation complete — {len(tickers)} tickers processed.")
+
+    # ══════════════════════════════════════════════════════════
+    # COMPUTE CORRELATIONS ONLY (NO Polygon calls)
+    # ══════════════════════════════════════════════════════════
+
+    async def compute_correlations_all(self):
+        """
+        Compute rolling pairwise correlations for ALL tickers in price_history.
+        CLI: python main.py --compute-correlations-all
+
+        No Polygon calls — works purely from existing data.
+        Resolves tickers from: SELECT DISTINCT ticker FROM price_history
+        """
+        if self.correlation_engine is None:
+            logger.error("CorrelationEngine not provided — cannot compute correlations")
+            return
+
+        tickers = self.supabase.get_all_price_history_tickers()
+        logger.info(f"[compute-correlations-all] Processing {len(tickers)} tickers from price_history: {tickers}")
+
+        # Load all price histories
+        min_prices_needed = int(
+            min(self.settings.correlation_lookback_periods)
+            * self.settings.correlation_min_overlap_pct
+        ) + 2
+
+        all_prices: dict[str, list[dict]] = {}
+        for ticker in tickers:
+            prices = self.supabase.get_full_price_history(ticker)
+            if len(prices) >= min_prices_needed:
+                all_prices[ticker] = prices
+            else:
+                logger.info(f"  {ticker}: only {len(prices)} prices — skipping (need {min_prices_needed})")
+
+        logger.info(f"  {len(all_prices)} tickers have sufficient data")
+
+        if len(all_prices) < 2:
+            logger.warning("  Not enough tickers for pairwise correlations — skipping")
+            return
+
+        for period in self.settings.correlation_lookback_periods:
+            logger.info(f"  Computing {period}-day rolling correlations...")
+            corr_rows = self.correlation_engine.compute_rolling_correlations(
+                all_prices=all_prices,
+                period_days=period,
+                min_overlap_pct=self.settings.correlation_min_overlap_pct,
+            )
+            if corr_rows:
+                self.supabase.upsert_global_correlations(corr_rows)
+
+        logger.info(f"Correlation computation complete — {len(all_prices)} tickers processed.")

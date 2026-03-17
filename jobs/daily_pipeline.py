@@ -18,6 +18,7 @@ WHAT THE PIPELINE DOES FOR EACH TICKER:
   Step 3: Backfill any ticker with no price data yet (full Polygon fetch)
   Step 4: Fetch latest 5 days of prices from Polygon (keeps data current)
   Step 5: Compute rolling VaR and upsert to var_calculations_precomputed
+  Step 6: Compute rolling pairwise correlations and upsert to global_correlations
 """
 
 import logging
@@ -28,6 +29,7 @@ from services.supabase_client import SupabaseClient
 from services.polygon_client import PolygonClient
 from services.sp500_tracker import SP500Tracker
 from services.var_engine import VaREngine
+from services.correlation_engine import CorrelationEngine
 from jobs.backfill import BackfillJob
 
 logger = logging.getLogger(__name__)
@@ -41,12 +43,14 @@ class DailyPipeline:
         polygon: PolygonClient,
         sp500_tracker: SP500Tracker,
         var_engine: VaREngine,
+        correlation_engine: CorrelationEngine,
     ):
         self.settings = settings
         self.supabase = supabase
         self.polygon = polygon
         self.sp500 = sp500_tracker
         self.var_engine = var_engine
+        self.correlation_engine = correlation_engine
 
     async def run(self):
         today = date.today()
@@ -55,7 +59,7 @@ class DailyPipeline:
         logger.info(self.settings.describe())
 
         # ── Step 1: Refresh S&P 500 list ──────────────────────
-        logger.info("Step 1/5: Refreshing S&P 500 constituents...")
+        logger.info("Step 1/6: Refreshing S&P 500 constituents...")
         try:
             diff = await self.sp500.refresh()
         except Exception as e:
@@ -64,10 +68,10 @@ class DailyPipeline:
 
         # ── Step 2: Resolve which tickers to process ──────────
         tickers = self._resolve_tickers()
-        logger.info(f"Step 2/5: Processing {len(tickers)} tickers: {tickers[:10]}{'...' if len(tickers) > 10 else ''}")
+        logger.info(f"Step 2/6: Processing {len(tickers)} tickers: {tickers[:10]}{'...' if len(tickers) > 10 else ''}")
 
         # ── Step 3: Backfill any tickers missing data ─────────
-        logger.info("Step 3/5: Checking for tickers that need backfill...")
+        logger.info("Step 3/6: Checking for tickers that need backfill...")
         backfill = BackfillJob(
             supabase=self.supabase,
             polygon=self.polygon,
@@ -81,12 +85,16 @@ class DailyPipeline:
                 await backfill.fetch_and_compute_var(ticker)
 
         # ── Step 4: Fetch latest prices from Polygon ──────────
-        logger.info(f"Step 4/5: Fetching latest closing prices for {len(tickers)} tickers...")
+        logger.info(f"Step 4/6: Fetching latest closing prices for {len(tickers)} tickers...")
         await self._fetch_daily_prices(tickers, today)
 
         # ── Step 5: Compute VaR ───────────────────────────────
-        logger.info(f"Step 5/5: Computing VaR for {len(tickers)} tickers...")
+        logger.info(f"Step 5/6: Computing VaR for {len(tickers)} tickers...")
         await self._compute_var_all(tickers)
+
+        # ── Step 6: Compute pairwise correlations ─────────────
+        logger.info(f"Step 6/6: Computing pairwise correlations for {len(tickers)} tickers...")
+        self._compute_correlations(tickers)
 
         logger.info(f"═══ Daily Pipeline Complete ({mode} MODE) ═══")
 
@@ -150,3 +158,46 @@ class DailyPipeline:
             )
             if var_rows:
                 self.supabase.upsert_var_calculations(var_rows)
+
+    def _compute_correlations(self, tickers: list[str]):
+        """
+        Fetch all price histories, compute rolling pairwise correlations
+        for each lookback period, and upsert to global_correlations.
+
+        Unlike VaR (which is per-ticker), correlations are cross-ticker:
+        we need all price histories loaded together so we can pair them.
+        """
+        # Load price history for all tickers that have enough data
+        # Minimum: need at least (shortest_period * min_overlap_pct) + 1 prices
+        min_prices_needed = int(
+            min(self.settings.correlation_lookback_periods)
+            * self.settings.correlation_min_overlap_pct
+        ) + 2
+
+        all_prices: dict[str, list[dict]] = {}
+        for ticker in tickers:
+            prices = self.supabase.get_full_price_history(ticker)
+            if len(prices) >= min_prices_needed:
+                all_prices[ticker] = prices
+            else:
+                logger.info(
+                    f"  {ticker}: only {len(prices)} prices — "
+                    f"skipping correlations (need {min_prices_needed})"
+                )
+
+        logger.info(f"  {len(all_prices)} tickers have sufficient data for correlations")
+
+        if len(all_prices) < 2:
+            logger.warning("  Not enough tickers for pairwise correlations — skipping")
+            return
+
+        # Compute correlations for each lookback period
+        for period in self.settings.correlation_lookback_periods:
+            logger.info(f"  Computing {period}-day rolling correlations...")
+            corr_rows = self.correlation_engine.compute_rolling_correlations(
+                all_prices=all_prices,
+                period_days=period,
+                min_overlap_pct=self.settings.correlation_min_overlap_pct,
+            )
+            if corr_rows:
+                self.supabase.upsert_global_correlations(corr_rows)

@@ -15,6 +15,7 @@ from services.supabase_client import SupabaseClient
 from services.polygon_client import PolygonClient
 from services.sp500_tracker import SP500Tracker
 from services.var_engine import VaREngine
+from services.correlation_engine import CorrelationEngine
 from jobs.daily_pipeline import DailyPipeline
 
 logging.basicConfig(
@@ -30,10 +31,12 @@ async def run_pipeline():
     polygon = PolygonClient(settings)
     sp500 = SP500Tracker(supabase)
     var_engine = VaREngine()
+    correlation_engine = CorrelationEngine()
 
     pipeline = DailyPipeline(
         settings=settings, supabase=supabase, polygon=polygon,
         sp500_tracker=sp500, var_engine=var_engine,
+        correlation_engine=correlation_engine,
     )
     await pipeline.run()
 

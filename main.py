@@ -4,11 +4,12 @@ StockPulse Backend — Entry Point
 
 CLI COMMANDS (quick reference):
 ─────────────────────────────────────────────────────────────────────────────
-  python main.py --run-daily                     ← Full daily pipeline (Polygon fetch + VaR) for all tickers in price_history
+  python main.py --run-daily                     ← Full daily pipeline (Polygon fetch + VaR + correlations) for all tickers
   python main.py --fetch-and-compute-var TSLA    ← Polygon fetch + VaR for ONE ticker
   python main.py --fetch-and-compute-var-all     ← Polygon fetch + VaR for ALL tickers in price_history
   python main.py --compute-var TSLA              ← VaR only for ONE ticker (NO Polygon calls)
   python main.py --compute-var-all               ← VaR only for ALL tickers in price_history (NO Polygon calls)
+  python main.py --compute-correlations-all      ← Correlations only for ALL tickers (NO Polygon calls)
   python main.py --refresh-sp500                 ← Refresh S&P 500 constituent list only
   python main.py --describe                      ← Print current config and exit
 ─────────────────────────────────────────────────────────────────────────────
@@ -36,6 +37,7 @@ from services.supabase_client import SupabaseClient
 from services.polygon_client import PolygonClient
 from services.sp500_tracker import SP500Tracker
 from services.var_engine import VaREngine
+from services.correlation_engine import CorrelationEngine
 from jobs.daily_pipeline import DailyPipeline
 from jobs.backfill import BackfillJob
 
@@ -53,10 +55,11 @@ async def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
             Examples:
-            python main.py --run-daily                     # Daily cron job
+            python main.py --run-daily                     # Daily cron job (VaR + correlations)
             python main.py --fetch-and-compute-var TSLA    # Add a new ticker end-to-end
             python main.py --compute-var TSLA              # Recompute VaR after manual price upload
             python main.py --compute-var-all               # Recompute VaR for everything in price_history
+            python main.py --compute-correlations-all      # Recompute correlations from existing price data
                     """,
     )
     group = parser.add_mutually_exclusive_group(required=True)
@@ -64,7 +67,7 @@ async def main():
     # ── Full daily pipeline ───────────────────────────────────
     group.add_argument(
         "--run-daily", action="store_true",
-        help="Full daily pipeline: Polygon fetch + VaR for all tickers in price_history",
+        help="Full daily pipeline: Polygon fetch + VaR + correlations for all tickers",
     )
 
     # ── Polygon fetch + VaR (calls Polygon API) ──────────────
@@ -85,6 +88,12 @@ async def main():
     group.add_argument(
         "--compute-var-all", action="store_true",
         help="Compute VaR for ALL tickers in price_history (no Polygon)",
+    )
+
+    # ── Correlations only (NO Polygon calls) ─────────────────
+    group.add_argument(
+        "--compute-correlations-all", action="store_true",
+        help="Compute pairwise correlations for ALL tickers from existing data (no Polygon)",
     )
 
     # ── Utilities ─────────────────────────────────────────────
@@ -109,21 +118,24 @@ async def main():
     polygon = PolygonClient(settings)
     sp500 = SP500Tracker(supabase)
     var_engine = VaREngine()
+    correlation_engine = CorrelationEngine()
 
     pipeline = DailyPipeline(
         settings=settings, supabase=supabase, polygon=polygon,
         sp500_tracker=sp500, var_engine=var_engine,
+        correlation_engine=correlation_engine,
     )
 
     backfill = BackfillJob(
         supabase=supabase, polygon=polygon,
         var_engine=var_engine, settings=settings,
+        correlation_engine=correlation_engine,
     )
 
     # ── Route to the correct action ──────────────────────────
     if args.run_daily:
         # Full daily pipeline: resolves tickers from price_history,
-        # fetches latest prices from Polygon, computes VaR
+        # fetches latest prices from Polygon, computes VaR + correlations
         await pipeline.run()
 
     elif args.fetch_and_compute_var:
@@ -143,6 +155,11 @@ async def main():
     elif args.compute_var_all:
         # VaR only for every ticker in price_history — no Polygon calls
         await backfill.compute_var_all()
+
+    elif args.compute_correlations_all:
+        # Correlations only — no Polygon calls
+        # Use this after manually uploading prices for new tickers
+        await backfill.compute_correlations_all()
 
     elif args.refresh_sp500:
         await sp500.refresh()

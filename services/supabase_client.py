@@ -164,6 +164,26 @@ class SupabaseClient:
             "business_date", before_date
         ).execute()
 
+    # ── Global Correlations ──────────────────────────────────
+
+    def upsert_global_correlations(self, rows: list[dict]) -> None:
+        """Upsert pairwise correlation rows to global_correlations."""
+        if not rows:
+            return
+        for i in range(0, len(rows), 1000):
+            chunk = rows[i : i + 1000]
+            self._client.table("global_correlations").upsert(
+                chunk,
+                on_conflict="ticker_a,ticker_b,period_days,business_date",
+            ).execute()
+        logger.info(f"Upserted {len(rows)} global_correlations rows")
+
+    def delete_old_correlations(self, before_date: str) -> None:
+        """Delete correlation rows older than a given date."""
+        self._client.table("global_correlations").delete().lt(
+            "business_date", before_date
+        ).execute()
+
     # ── Watchlist ─────────────────────────────────────────────
 
     def get_all_watched_tickers(self) -> list[str]:

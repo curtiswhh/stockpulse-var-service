@@ -76,6 +76,10 @@ class Settings:
     polygon_batch_size: int = 5
     price_fetch_delay_sec: float = 12.5
 
+    # ── Correlation Parameters ─────────────────────────────────
+    correlation_lookback_periods: tuple = (90, 252)   # 90-day and 1-year
+    correlation_min_overlap_pct: float = 0.8          # require 80% date overlap
+
     # ── S&P 500 Source ────────────────────────────────────────
     sp500_wikipedia_url: str = (
         "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -101,4 +105,6 @@ class Settings:
             f"  Backfill days:      {self.var_max_backfill_days}\n"
             f"  VaR confidence:     {self.var_confidence_level}\n"
             f"  VaR lookback:       {self.var_lookback_days} trading days\n"
+            f"  Correlation periods: {list(self.correlation_lookback_periods)} days\n"
+            f"  Correlation overlap: {self.correlation_min_overlap_pct:.0%}\n"
         )
