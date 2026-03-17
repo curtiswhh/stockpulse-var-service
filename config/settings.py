@@ -39,8 +39,10 @@ class Settings:
         default_factory=lambda: os.environ["SUPABASE_SERVICE_ROLE_KEY"]
     )
 
-    # ── Polygon.io ────────────────────────────────────────────
-    polygon_api_key: str = field(default_factory=lambda: os.environ["POLYGON_API_KEY"])
+    # ── Polygon.io (fallback — optional if using yfinance as primary) ──
+    polygon_api_key: str = field(
+        default_factory=lambda: os.environ.get("POLYGON_API_KEY", "")
+    )
 
     # ══════════════════════════════════════════════════════════
     # TEST / PRODUCTION MODE

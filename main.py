@@ -34,7 +34,7 @@ import logging
 
 from config.settings import Settings
 from services.supabase_client import SupabaseClient
-from services.polygon_client import PolygonClient
+from services.price_data_client import PriceDataClient
 from services.sp500_tracker import SP500Tracker
 from services.var_engine import VaREngine
 from services.correlation_engine import CorrelationEngine
@@ -115,19 +115,19 @@ async def main():
         return
 
     supabase = SupabaseClient(settings)
-    polygon = PolygonClient(settings)
+    price_client = PriceDataClient(settings)
     sp500 = SP500Tracker(supabase)
     var_engine = VaREngine()
     correlation_engine = CorrelationEngine()
 
     pipeline = DailyPipeline(
-        settings=settings, supabase=supabase, polygon=polygon,
+        settings=settings, supabase=supabase, price_client=price_client,
         sp500_tracker=sp500, var_engine=var_engine,
         correlation_engine=correlation_engine,
     )
 
     backfill = BackfillJob(
-        supabase=supabase, polygon=polygon,
+        supabase=supabase, price_client=price_client,
         var_engine=var_engine, settings=settings,
         correlation_engine=correlation_engine,
     )
@@ -135,7 +135,7 @@ async def main():
     # ── Route to the correct action ──────────────────────────
     if args.run_daily:
         # Full daily pipeline: resolves tickers from price_history,
-        # fetches latest prices from Polygon, computes VaR + correlations
+        # fetches latest prices (yfinance → Polygon), computes VaR + correlations
         await pipeline.run()
 
     elif args.fetch_and_compute_var:

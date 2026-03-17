@@ -26,7 +26,7 @@ from datetime import date, timedelta
 
 from config.settings import Settings
 from services.supabase_client import SupabaseClient
-from services.polygon_client import PolygonClient
+from services.price_data_client import PriceDataClient
 from services.sp500_tracker import SP500Tracker
 from services.var_engine import VaREngine
 from services.correlation_engine import CorrelationEngine
@@ -40,14 +40,14 @@ class DailyPipeline:
         self,
         settings: Settings,
         supabase: SupabaseClient,
-        polygon: PolygonClient,
+        price_client: PriceDataClient,
         sp500_tracker: SP500Tracker,
         var_engine: VaREngine,
         correlation_engine: CorrelationEngine,
     ):
         self.settings = settings
         self.supabase = supabase
-        self.polygon = polygon
+        self.price_client = price_client
         self.sp500 = sp500_tracker
         self.var_engine = var_engine
         self.correlation_engine = correlation_engine
@@ -74,7 +74,7 @@ class DailyPipeline:
         logger.info("Step 3/6: Checking for tickers that need backfill...")
         backfill = BackfillJob(
             supabase=self.supabase,
-            polygon=self.polygon,
+            price_client=self.price_client,
             var_engine=self.var_engine,
             settings=self.settings,
         )
@@ -84,8 +84,9 @@ class DailyPipeline:
                 logger.info(f"  {ticker}: no data found, running full backfill...")
                 await backfill.fetch_and_compute_var(ticker)
 
-        # ── Step 4: Fetch latest prices from Polygon ──────────
+        # ── Step 4: Fetch latest prices ────────────────────────
         logger.info(f"Step 4/6: Fetching latest closing prices for {len(tickers)} tickers...")
+        await self._fetch_daily_prices(tickers, today)
         await self._fetch_daily_prices(tickers, today)
 
         # ── Step 5: Compute VaR ───────────────────────────────
@@ -132,11 +133,11 @@ class DailyPipeline:
         return combined
 
     async def _fetch_daily_prices(self, tickers: list[str], today: date):
-        """Fetch the last 5 days of prices from Polygon for each ticker."""
+        """Fetch the last 5 days of prices for each ticker (yfinance → Polygon fallback)."""
         from_date = today - timedelta(days=5)
         for i, ticker in enumerate(tickers):
             logger.info(f"  [{i+1}/{len(tickers)}] Fetching prices for {ticker}...")
-            bars = await self.polygon.get_daily_bars(ticker, from_date, today)
+            bars = await self.price_client.get_daily_bars(ticker, from_date, today)
             if bars:
                 self.supabase.upsert_price_history(bars)
 

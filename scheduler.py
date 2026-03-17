@@ -12,7 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from config.settings import Settings
 from services.supabase_client import SupabaseClient
-from services.polygon_client import PolygonClient
+from services.price_data_client import PriceDataClient
 from services.sp500_tracker import SP500Tracker
 from services.var_engine import VaREngine
 from services.correlation_engine import CorrelationEngine
@@ -28,13 +28,13 @@ logger = logging.getLogger("scheduler")
 async def run_pipeline():
     settings = Settings()
     supabase = SupabaseClient(settings)
-    polygon = PolygonClient(settings)
+    price_client = PriceDataClient(settings)
     sp500 = SP500Tracker(supabase)
     var_engine = VaREngine()
     correlation_engine = CorrelationEngine()
 
     pipeline = DailyPipeline(
-        settings=settings, supabase=supabase, polygon=polygon,
+        settings=settings, supabase=supabase, price_client=price_client,
         sp500_tracker=sp500, var_engine=var_engine,
         correlation_engine=correlation_engine,
     )

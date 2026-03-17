@@ -20,31 +20,30 @@ from datetime import date, timedelta
 
 from config.settings import Settings
 from services.supabase_client import SupabaseClient
-from services.polygon_client import PolygonClient
 from services.var_engine import VaREngine
 
 logger = logging.getLogger(__name__)
 
 
 class BackfillJob:
-    def __init__(self, supabase, polygon, var_engine, settings, correlation_engine=None):
+    def __init__(self, supabase, price_client, var_engine, settings, correlation_engine=None):
         self.supabase = supabase
-        self.polygon = polygon
+        self.price_client = price_client
         self.var_engine = var_engine
         self.settings = settings
         self.correlation_engine = correlation_engine
 
     # ══════════════════════════════════════════════════════════
-    # FETCH + COMPUTE VAR (calls Polygon API)
+    # FETCH + COMPUTE VAR (fetches price data via yfinance/Polygon)
     # ══════════════════════════════════════════════════════════
 
     async def fetch_and_compute_var(self, ticker: str):
         """
-        Fetch prices from Polygon + compute VaR for ONE ticker.
+        Fetch prices + compute VaR for ONE ticker.
         CLI: python main.py --fetch-and-compute-var TSLA
 
         Steps:
-          1. Fetch ~1000 days of daily bars from Polygon API
+          1. Fetch ~1000 days of daily bars (yfinance → Polygon fallback)
           2. Upsert into price_history in Supabase
           3. Read back full price history from Supabase
           4. Compute rolling daily VaR
@@ -62,21 +61,21 @@ class BackfillJob:
             from_date = earliest_needed
             logger.info(f"  {ticker}: full fetch from {from_date}")
 
-        # ── Step 1: Fetch price data from Polygon in yearly chunks ──
+        # ── Step 1: Fetch price data in yearly chunks ────────────
         current_start = from_date
         all_bars: list[dict] = []
         while current_start <= today:
             chunk_end = min(current_start + timedelta(days=365), today)
-            bars = await self.polygon.get_daily_bars(ticker, current_start, chunk_end)
+            bars = await self.price_client.get_daily_bars(ticker, current_start, chunk_end)
             all_bars.extend(bars)
             current_start = chunk_end + timedelta(days=1)
 
         # ── Step 2: Upsert price data ──
         if all_bars:
             self.supabase.upsert_price_history(all_bars)
-            logger.info(f"  {ticker}: loaded {len(all_bars)} daily bars from Polygon")
+            logger.info(f"  {ticker}: loaded {len(all_bars)} daily bars")
         else:
-            logger.warning(f"  {ticker}: no data returned from Polygon")
+            logger.warning(f"  {ticker}: no data returned from any source")
             return
 
         # ── Steps 3-5: Compute and store VaR ──
