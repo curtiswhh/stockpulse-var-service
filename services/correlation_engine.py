@@ -16,6 +16,14 @@ Logic:
     for a pair in the window, skip that pair for that date.
 
 Output rows match the global_correlations table schema.
+
+NOTE ON PAIR ORDERING:
+  The global_correlations table enforces ticker_a < ticker_b using
+  PostgreSQL's default text comparison (C locale / byte ordering).
+  Python's str < operator uses Unicode codepoint ordering which can
+  differ for special characters like ^ (used in ^GSPC).
+  We use .encode('utf-8') comparison to match PostgreSQL's C locale
+  byte ordering, ensuring the CHECK constraint is always satisfied.
 """
 
 import logging
@@ -24,6 +32,21 @@ from datetime import datetime
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _pg_ordered_pair(a: str, b: str) -> tuple[str, str]:
+    """
+    Return (ticker_a, ticker_b) ordered to match the global_correlations
+    CHECK constraint, which uses C collation (byte ordering).
+
+    Python's str < comparison uses Unicode codepoints, which matches
+    C collation for ASCII strings. This ensures the CHECK constraint
+    (ticker_a COLLATE "C" < ticker_b COLLATE "C") is always satisfied.
+    """
+    if a < b:
+        return (a, b)
+    else:
+        return (b, a)
 
 
 class CorrelationEngine:
@@ -96,8 +119,10 @@ class CorrelationEngine:
 
         for i in range(len(valid_tickers)):
             for j in range(i + 1, len(valid_tickers)):
-                ticker_a = valid_tickers[i]
-                ticker_b = valid_tickers[j]
+                # Order pair to match the database CHECK constraint
+                ticker_a, ticker_b = _pg_ordered_pair(
+                    valid_tickers[i], valid_tickers[j]
+                )
                 returns_a = returns_by_ticker[ticker_a]
                 returns_b = returns_by_ticker[ticker_b]
 
