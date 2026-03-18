@@ -22,7 +22,9 @@ TEST_MODE vs PRODUCTION:
 
 import os
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 try:
     from dotenv import load_dotenv
@@ -110,3 +112,24 @@ class Settings:
             f"  Correlation periods: {list(self.correlation_lookback_periods)} days\n"
             f"  Correlation overlap: {self.correlation_min_overlap_pct:.0%}\n"
         )
+
+
+def safe_fetch_date() -> date:
+    """
+    Return the latest date we can safely fetch closing prices for.
+
+    If US market is still open (before 4:00 PM ET on a weekday),
+    returns yesterday so we don't write incomplete intraday bars
+    into price_history. After market close, returns today.
+
+    Weekend/holiday: returns today (markets are closed, yfinance
+    won't return a bar for a non-trading day anyway).
+    """
+    et_now = datetime.now(ZoneInfo("America/New_York"))
+    is_weekday = et_now.weekday() < 5  # Mon=0 .. Fri=4
+    market_closed = et_now.hour >= 16   # 4:00 PM ET
+
+    if is_weekday and not market_closed:
+        return date.today() - timedelta(days=1)
+
+    return date.today()

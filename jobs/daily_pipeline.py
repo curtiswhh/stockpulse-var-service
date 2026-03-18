@@ -24,7 +24,7 @@ WHAT THE PIPELINE DOES FOR EACH TICKER:
 import logging
 from datetime import date, timedelta
 
-from config.settings import Settings
+from config.settings import Settings, safe_fetch_date
 from services.supabase_client import SupabaseClient
 from services.price_data_client import PriceDataClient
 from services.sp500_tracker import SP500Tracker
@@ -57,8 +57,13 @@ class DailyPipeline:
 
     async def run(self):
         today = date.today()
+        fetch_date = safe_fetch_date()
         mode = "TEST" if self.settings.test_mode else "PRODUCTION"
         logger.info(f"═══ Daily Pipeline ({mode} MODE) — {today.isoformat()} ═══")
+        if fetch_date < today:
+            logger.info(f"  ⚠ Market still open — fetch date capped to {fetch_date}")
+        else:
+            logger.info(f"  Fetch date: {fetch_date}")
         logger.info(self.settings.describe())
 
         # ── Step 1: Refresh S&P 500 list ──────────────────────
@@ -89,9 +94,8 @@ class DailyPipeline:
                 await backfill.fetch_and_compute_var(ticker)
 
         # ── Step 4: Fetch latest prices ────────────────────────
-        logger.info(f"Step 4/7: Fetching latest closing prices for {len(tickers)} tickers...")
-        await self._fetch_daily_prices(tickers, today)
-        await self._fetch_daily_prices(tickers, today)
+        logger.info(f"Step 4/7: Fetching latest closing prices for {len(tickers)} tickers (up to {fetch_date})...")
+        await self._fetch_daily_prices(tickers, fetch_date)
 
         # ── Step 5: Compute VaR ───────────────────────────────
         logger.info(f"Step 5/7: Computing VaR for {len(tickers)} tickers...")

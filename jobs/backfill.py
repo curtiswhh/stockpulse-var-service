@@ -18,7 +18,7 @@ TICKER RESOLUTION:
 import logging
 from datetime import date, timedelta
 
-from config.settings import Settings
+from config.settings import Settings, safe_fetch_date
 from services.supabase_client import SupabaseClient
 from services.var_engine import VaREngine
 
@@ -51,7 +51,7 @@ class BackfillJob:
           5. Upsert results into var_calculations_precomputed
         """
         logger.info(f"[fetch-and-compute-var] {ticker}: starting...")
-        today = date.today()
+        today = safe_fetch_date()
         earliest_needed = today - timedelta(days=self.settings.var_max_backfill_days + 30)
         latest_in_db = self.supabase.get_latest_price_date(ticker)
 
