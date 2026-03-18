@@ -30,6 +30,7 @@ from services.price_data_client import PriceDataClient
 from services.sp500_tracker import SP500Tracker
 from services.var_engine import VaREngine
 from services.correlation_engine import CorrelationEngine
+from services.volatility_engine import VolatilityEngine
 from jobs.backfill import BackfillJob
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ class DailyPipeline:
         sp500_tracker: SP500Tracker,
         var_engine: VaREngine,
         correlation_engine: CorrelationEngine,
+        volatility_engine: VolatilityEngine | None = None,
     ):
         self.settings = settings
         self.supabase = supabase
@@ -51,6 +53,7 @@ class DailyPipeline:
         self.sp500 = sp500_tracker
         self.var_engine = var_engine
         self.correlation_engine = correlation_engine
+        self.volatility_engine = volatility_engine or VolatilityEngine()
 
     async def run(self):
         today = date.today()
@@ -59,7 +62,7 @@ class DailyPipeline:
         logger.info(self.settings.describe())
 
         # ── Step 1: Refresh S&P 500 list ──────────────────────
-        logger.info("Step 1/6: Refreshing S&P 500 constituents...")
+        logger.info("Step 1/7: Refreshing S&P 500 constituents...")
         try:
             diff = await self.sp500.refresh()
         except Exception as e:
@@ -68,15 +71,16 @@ class DailyPipeline:
 
         # ── Step 2: Resolve which tickers to process ──────────
         tickers = self._resolve_tickers()
-        logger.info(f"Step 2/6: Processing {len(tickers)} tickers: {tickers[:10]}{'...' if len(tickers) > 10 else ''}")
+        logger.info(f"Step 2/7: Processing {len(tickers)} tickers: {tickers[:10]}{'...' if len(tickers) > 10 else ''}")
 
         # ── Step 3: Backfill any tickers missing data ─────────
-        logger.info("Step 3/6: Checking for tickers that need backfill...")
+        logger.info("Step 3/7: Checking for tickers that need backfill...")
         backfill = BackfillJob(
             supabase=self.supabase,
             price_client=self.price_client,
             var_engine=self.var_engine,
             settings=self.settings,
+            volatility_engine=self.volatility_engine,
         )
         for ticker in tickers:
             latest = self.supabase.get_latest_price_date(ticker)
@@ -85,16 +89,20 @@ class DailyPipeline:
                 await backfill.fetch_and_compute_var(ticker)
 
         # ── Step 4: Fetch latest prices ────────────────────────
-        logger.info(f"Step 4/6: Fetching latest closing prices for {len(tickers)} tickers...")
+        logger.info(f"Step 4/7: Fetching latest closing prices for {len(tickers)} tickers...")
         await self._fetch_daily_prices(tickers, today)
         await self._fetch_daily_prices(tickers, today)
 
         # ── Step 5: Compute VaR ───────────────────────────────
-        logger.info(f"Step 5/6: Computing VaR for {len(tickers)} tickers...")
+        logger.info(f"Step 5/7: Computing VaR for {len(tickers)} tickers...")
         await self._compute_var_all(tickers)
 
-        # ── Step 6: Compute pairwise correlations ─────────────
-        logger.info(f"Step 6/6: Computing pairwise correlations for {len(tickers)} tickers...")
+        # ── Step 6: Compute per-stock volatility ──────────────
+        logger.info(f"Step 6/7: Computing per-stock volatility for {len(tickers)} tickers...")
+        self._compute_volatility_all(tickers)
+
+        # ── Step 7: Compute pairwise correlations ─────────────
+        logger.info(f"Step 7/7: Computing pairwise correlations for {len(tickers)} tickers...")
         self._compute_correlations(tickers)
 
         logger.info(f"═══ Daily Pipeline Complete ({mode} MODE) ═══")
@@ -159,6 +167,24 @@ class DailyPipeline:
             )
             if var_rows:
                 self.supabase.upsert_var_calculations(var_rows)
+
+    def _compute_volatility_all(self, tickers: list[str]):
+        """Compute rolling daily volatility for each ticker and upsert to stock_volatility."""
+        for i, ticker in enumerate(tickers):
+            logger.info(f"  [{i+1}/{len(tickers)}] Computing volatility for {ticker}...")
+            prices = self.supabase.get_full_price_history(ticker)
+
+            if len(prices) < self.settings.var_lookback_days + 2:
+                logger.warning(f"  {ticker}: only {len(prices)} prices — skipping vol (need {self.settings.var_lookback_days + 2})")
+                continue
+
+            vol_rows = self.volatility_engine.compute_rolling_volatility(
+                ticker=ticker,
+                prices=prices,
+                lookback_days=self.settings.var_lookback_days,
+            )
+            if vol_rows:
+                self.supabase.upsert_stock_volatility(vol_rows)
 
     def _compute_correlations(self, tickers: list[str]):
         """

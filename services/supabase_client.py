@@ -146,6 +146,26 @@ class SupabaseClient:
         logger.info(f"  {ticker}: fetched {len(all_rows)} total price rows from Supabase")
         return all_rows
 
+    # ── Stock Volatility ─────────────────────────────────────
+
+    def upsert_stock_volatility(self, rows: list[dict]) -> None:
+        """Upsert per-stock volatility rows to stock_volatility table."""
+        if not rows:
+            return
+        for i in range(0, len(rows), 1000):
+            chunk = rows[i : i + 1000]
+            self._client.table("stock_volatility").upsert(
+                chunk,
+                on_conflict="ticker,business_date,lookback_days",
+            ).execute()
+        logger.info(f"Upserted {len(rows)} stock_volatility rows")
+
+    def delete_old_volatility(self, before_date: str) -> None:
+        """Delete volatility rows older than a given date."""
+        self._client.table("stock_volatility").delete().lt(
+            "business_date", before_date
+        ).execute()
+        
     # ── VaR Calculations (precomputed) ────────────────────────
 
     def upsert_var_calculations(self, rows: list[dict]) -> None:
