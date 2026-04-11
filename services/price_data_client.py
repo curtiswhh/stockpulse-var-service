@@ -42,9 +42,12 @@ class PriceDataClient:
         # ── Primary: yfinance ─────────────────────────────────────
         try:
             bars = await self.yfinance.get_daily_bars(ticker, from_date, to_date)
-            if bars:
+            if bars and all(b.get("close") is not None for b in bars):
                 return bars
-            logger.warning(f"  {ticker}: yfinance returned no data, trying Polygon...")
+            if bars:
+                logger.warning(f"  {ticker}: yfinance returned bars with null prices, trying Polygon...")
+            else:
+                logger.warning(f"  {ticker}: yfinance returned no data, trying Polygon...")
         except Exception as e:
             logger.warning(f"  {ticker}: yfinance failed ({e}), trying Polygon...")
 
