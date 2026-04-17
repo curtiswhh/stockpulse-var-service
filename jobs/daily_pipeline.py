@@ -147,11 +147,22 @@ class DailyPipeline:
     async def _fetch_daily_prices(self, tickers: list[str], today: date):
         """Fetch the last 5 days of prices for each ticker (yfinance → Polygon fallback)."""
         from_date = today - timedelta(days=5)
+        seen_business_dates: set = set()
+
         for i, ticker in enumerate(tickers):
             logger.info(f"  [{i+1}/{len(tickers)}] Fetching prices for {ticker}...")
             bars = await self.price_client.get_daily_bars(ticker, from_date, today)
             if bars:
                 self.supabase.upsert_price_history(bars)
+                for bar in bars:
+                    bd = bar.get("business_date")
+                    if bd is not None:
+                        seen_business_dates.add(bd)
+
+        if seen_business_dates:
+            self.supabase.upsert_business_dates(
+                sorted(seen_business_dates), calendar_code="US"
+            )
 
     async def _compute_var_all(self, tickers: list[str]):
         """Compute rolling VaR for each ticker and upsert to var_calculations_precomputed."""

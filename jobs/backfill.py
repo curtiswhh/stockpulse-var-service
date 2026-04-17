@@ -75,6 +75,10 @@ class BackfillJob:
         if all_bars:
             self.supabase.upsert_price_history(all_bars)
             logger.info(f"  {ticker}: loaded {len(all_bars)} daily bars")
+
+            seen_dates = {bar.get("business_date") for bar in all_bars if bar.get("business_date") is not None}
+            if seen_dates:
+                self.supabase.upsert_business_dates(sorted(seen_dates), calendar_code="US")
         else:
             logger.warning(f"  {ticker}: no data returned from any source")
             return

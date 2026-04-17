@@ -109,6 +109,48 @@ class SupabaseClient:
             ).execute()
         logger.info(f"Upserted {len(rows)} price_history rows")
 
+    # ── Business Dates ────────────────────────────────────────
+
+    def upsert_business_dates(
+        self,
+        business_dates: list[str] | list,
+        calendar_code: str = "US",
+    ) -> None:
+        """
+        Insert any new distinct business dates into the business_dates table.
+
+        Called by the daily pipeline after price upsert: every date we just
+        wrote price data for is, by definition, a business date for that
+        calendar. ON CONFLICT DO NOTHING makes re-runs idempotent.
+
+        Accepts either iso-format strings ("2026-04-17") or date objects.
+        """
+        if not business_dates:
+            return
+
+        # Normalize to iso strings, dedupe
+        normalized = set()
+        for d in business_dates:
+            if isinstance(d, (date, datetime)):
+                normalized.add(d.isoformat()[:10])
+            else:
+                normalized.add(str(d))
+
+        rows = [
+            {"calendar_code": calendar_code, "business_date": d}
+            for d in sorted(normalized)
+        ]
+
+        for i in range(0, len(rows), 1000):
+            chunk = rows[i : i + 1000]
+            self._client.table("business_dates").upsert(
+                chunk, on_conflict="calendar_code,business_date"
+            ).execute()
+        logger.info(
+            f"Upserted {len(rows)} business_dates rows "
+            f"(calendar_code={calendar_code})"
+        )
+
     def get_price_history(self, ticker: str, lookback_days: int) -> list[dict]:
         resp = (
             self._client.table("price_history")
