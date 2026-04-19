@@ -3,7 +3,7 @@ Daily Pipeline — runs as the GitHub Actions cron job.
 ========================================================
 
 TICKER RESOLUTION (how the pipeline decides which stocks to process):
-  1. Query Supabase for all distinct tickers in price_history
+  1. Query Supabase for all distinct tickers in stock_price
   2. That's the list. Every ticker with price data gets processed.
 
   In PRODUCTION mode, S&P 500 tickers from sp500_constituents are also
@@ -14,11 +14,13 @@ TICKER RESOLUTION (how the pipeline decides which stocks to process):
 
 WHAT THE PIPELINE DOES FOR EACH TICKER:
   Step 1: Refresh S&P 500 constituent list (non-fatal if it fails)
-  Step 2: Resolve tickers (from price_history + S&P 500 in production)
+  Step 2: Resolve tickers (from stock_price + S&P 500 in production)
   Step 3: Backfill any ticker with no price data yet (full Polygon fetch)
   Step 4: Fetch latest 5 days of prices from Polygon (keeps data current)
-  Step 5: Compute rolling VaR and upsert to var_calculations_precomputed
-  Step 6: Compute rolling pairwise correlations and upsert to global_correlations
+  Step 5: Compute daily returns and upsert to stock_return
+  Step 6: Compute rolling VaR and upsert to stock_var
+  Step 7: Compute rolling per-stock volatility and upsert to stock_volatility
+  Step 8: Compute rolling pairwise correlations and upsert to stock_correlation
 """
 
 import logging
@@ -31,6 +33,7 @@ from services.sp500_tracker import SP500Tracker
 from services.var_engine import VaREngine
 from services.correlation_engine import CorrelationEngine
 from services.volatility_engine import VolatilityEngine
+from services.return_engine import ReturnEngine
 from jobs.backfill import BackfillJob
 
 logger = logging.getLogger(__name__)
@@ -46,6 +49,7 @@ class DailyPipeline:
         var_engine: VaREngine,
         correlation_engine: CorrelationEngine,
         volatility_engine: VolatilityEngine | None = None,
+        return_engine: ReturnEngine | None = None,
     ):
         self.settings = settings
         self.supabase = supabase
@@ -54,6 +58,7 @@ class DailyPipeline:
         self.var_engine = var_engine
         self.correlation_engine = correlation_engine
         self.volatility_engine = volatility_engine or VolatilityEngine()
+        self.return_engine = return_engine or ReturnEngine()
 
     async def run(self):
         today = date.today()
@@ -67,7 +72,7 @@ class DailyPipeline:
         logger.info(self.settings.describe())
 
         # ── Step 1: Refresh S&P 500 list ──────────────────────
-        logger.info("Step 1/7: Refreshing S&P 500 constituents...")
+        logger.info("Step 1/8: Refreshing S&P 500 constituents...")
         try:
             diff = await self.sp500.refresh()
         except Exception as e:
@@ -76,16 +81,17 @@ class DailyPipeline:
 
         # ── Step 2: Resolve which tickers to process ──────────
         tickers = self._resolve_tickers()
-        logger.info(f"Step 2/7: Processing {len(tickers)} tickers: {tickers[:10]}{'...' if len(tickers) > 10 else ''}")
+        logger.info(f"Step 2/8: Processing {len(tickers)} tickers: {tickers[:10]}{'...' if len(tickers) > 10 else ''}")
 
         # ── Step 3: Backfill any tickers missing data ─────────
-        logger.info("Step 3/7: Checking for tickers that need backfill...")
+        logger.info("Step 3/8: Checking for tickers that need backfill...")
         backfill = BackfillJob(
             supabase=self.supabase,
             price_client=self.price_client,
             var_engine=self.var_engine,
             settings=self.settings,
             volatility_engine=self.volatility_engine,
+            return_engine=self.return_engine,
         )
         for ticker in tickers:
             latest = self.supabase.get_latest_price_date(ticker)
@@ -94,19 +100,23 @@ class DailyPipeline:
                 await backfill.fetch_and_compute_var(ticker)
 
         # ── Step 4: Fetch latest prices ────────────────────────
-        logger.info(f"Step 4/7: Fetching latest closing prices for {len(tickers)} tickers (up to {fetch_date})...")
+        logger.info(f"Step 4/8: Fetching latest closing prices for {len(tickers)} tickers (up to {fetch_date})...")
         await self._fetch_daily_prices(tickers, fetch_date)
 
-        # ── Step 5: Compute VaR ───────────────────────────────
-        logger.info(f"Step 5/7: Computing VaR for {len(tickers)} tickers...")
+        # ── Step 5: Compute daily returns ──────────────────────
+        logger.info(f"Step 5/8: Computing daily returns for {len(tickers)} tickers...")
+        self._compute_returns_all(tickers)
+
+        # ── Step 6: Compute VaR ───────────────────────────────
+        logger.info(f"Step 6/8: Computing VaR for {len(tickers)} tickers...")
         await self._compute_var_all(tickers)
 
-        # ── Step 6: Compute per-stock volatility ──────────────
-        logger.info(f"Step 6/7: Computing per-stock volatility for {len(tickers)} tickers...")
+        # ── Step 7: Compute per-stock volatility ──────────────
+        logger.info(f"Step 7/8: Computing per-stock volatility for {len(tickers)} tickers...")
         self._compute_volatility_all(tickers)
 
-        # ── Step 7: Compute pairwise correlations ─────────────
-        logger.info(f"Step 7/7: Computing pairwise correlations for {len(tickers)} tickers...")
+        # ── Step 8: Compute pairwise correlations ─────────────
+        logger.info(f"Step 8/8: Computing pairwise correlations for {len(tickers)} tickers...")
         self._compute_correlations(tickers)
 
         logger.info(f"═══ Daily Pipeline Complete ({mode} MODE) ═══")
@@ -118,27 +128,21 @@ class DailyPipeline:
         Build the combined ticker list for the daily pipeline.
 
         Resolution logic:
-          1. Always include all distinct tickers from price_history
+          1. Always include all distinct tickers from stock_price
              (this is the primary source — if it has price data, we process it)
           2. In PRODUCTION mode, also merge in active S&P 500 tickers
              (so newly added S&P 500 stocks get picked up for backfill)
           3. Return deduplicated, sorted list
-
-        NOTE: seed_tickers from settings.py are NOT used here.
-        The daily pipeline relies entirely on what's in the database.
         """
-        # Primary source: every ticker that already has price data
         existing_in_db = set(self.supabase.get_all_price_history_tickers())
-        logger.info(f"  Tickers in price_history: {sorted(existing_in_db)}")
+        logger.info(f"  Tickers in stock_price: {sorted(existing_in_db)}")
 
-        # In production mode, also include S&P 500 constituents
-        # (these may not have price data yet — Step 3 will backfill them)
         if not self.settings.test_mode:
             sp500_tickers = set(self.sp500.get_active_tickers())
             logger.info(f"  PRODUCTION MODE: merging {len(sp500_tickers)} S&P 500 tickers")
             combined = sorted(existing_in_db | sp500_tickers)
         else:
-            logger.info(f"  TEST MODE: using price_history tickers only")
+            logger.info(f"  TEST MODE: using stock_price tickers only")
             combined = sorted(existing_in_db)
 
         logger.info(f"  Final ticker list ({len(combined)}): {combined[:15]}{'...' if len(combined) > 15 else ''}")
@@ -164,8 +168,22 @@ class DailyPipeline:
                 sorted(seen_business_dates), calendar_code="US"
             )
 
+    def _compute_returns_all(self, tickers: list[str]):
+        """Compute daily returns for each ticker and upsert to stock_return."""
+        for i, ticker in enumerate(tickers):
+            logger.info(f"  [{i+1}/{len(tickers)}] Computing returns for {ticker}...")
+            prices = self.supabase.get_full_price_history(ticker)
+
+            if len(prices) < 2:
+                logger.warning(f"  {ticker}: only {len(prices)} prices — skipping returns")
+                continue
+
+            rows = self.return_engine.compute_daily_returns(ticker=ticker, prices=prices)
+            if rows:
+                self.supabase.upsert_stock_returns(rows)
+
     async def _compute_var_all(self, tickers: list[str]):
-        """Compute rolling VaR for each ticker and upsert to var_calculations_precomputed."""
+        """Compute rolling VaR for each ticker and upsert to stock_var."""
         for i, ticker in enumerate(tickers):
             logger.info(f"  [{i+1}/{len(tickers)}] Computing VaR for {ticker}...")
             prices = self.supabase.get_full_price_history(ticker)
@@ -204,13 +222,11 @@ class DailyPipeline:
     def _compute_correlations(self, tickers: list[str]):
         """
         Fetch all price histories, compute rolling pairwise correlations
-        for each lookback period, and upsert to global_correlations.
+        for each lookback period, and upsert to stock_correlation.
 
         Unlike VaR (which is per-ticker), correlations are cross-ticker:
         we need all price histories loaded together so we can pair them.
         """
-        # Load price history for all tickers that have enough data
-        # Minimum: need at least (shortest_period * min_overlap_pct) + 1 prices
         min_prices_needed = int(
             min(self.settings.correlation_lookback_periods)
             * self.settings.correlation_min_overlap_pct
@@ -233,7 +249,6 @@ class DailyPipeline:
             logger.warning("  Not enough tickers for pairwise correlations — skipping")
             return
 
-        # Compute correlations for each lookback period
         for period in self.settings.correlation_lookback_periods:
             logger.info(f"  Computing {period}-day rolling correlations...")
             corr_rows = self.correlation_engine.compute_rolling_correlations(

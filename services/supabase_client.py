@@ -3,11 +3,16 @@ Supabase client — thin wrapper around supabase-py.
 ========================================================
 
 KEY METHOD FOR TICKER RESOLUTION:
-  get_all_price_history_tickers() → returns all distinct tickers in price_history.
+  get_all_price_history_tickers() → returns all distinct tickers in stock_price.
   This is the primary way the daily pipeline and CLI commands determine
-  which stocks to process. If a ticker has rows in price_history, it's included.
+  which stocks to process. If a ticker has rows in stock_price, it's included.
 
-Updated: date→business_date, calc_date→business_date, no id columns.
+Table name mapping (as of migration 009):
+  price_history                → stock_price
+  var_calculations_precomputed → stock_var
+  global_correlations          → stock_correlation
+  stock_volatility             → stock_volatility  (unchanged)
+  stock_return                 → stock_return      (new this round)
 """
 
 import logging
@@ -50,11 +55,11 @@ class SupabaseClient:
         ).in_("ticker", removed_tickers).execute()
         logger.info(f"Marked {len(removed_tickers)} tickers as removed")
 
-    # ── Price History ─────────────────────────────────────────
+    # ── Stock Price ───────────────────────────────────────────
 
     def get_all_price_history_tickers(self) -> list[str]:
         """
-        Return all distinct tickers that have data in price_history.
+        Return all distinct tickers that have data in stock_price.
 
         THIS IS THE PRIMARY TICKER RESOLUTION METHOD.
         The daily pipeline and CLI "--all" commands use this to determine
@@ -69,7 +74,7 @@ class SupabaseClient:
 
         while True:
             resp = (
-                self._client.table("price_history")
+                self._client.table("stock_price")
                 .select("ticker")
                 .range(offset, offset + page_size - 1)
                 .execute()
@@ -83,12 +88,12 @@ class SupabaseClient:
             offset += page_size
 
         result = sorted(all_tickers)
-        logger.info(f"Found {len(result)} distinct tickers in price_history: {result}")
+        logger.info(f"Found {len(result)} distinct tickers in stock_price: {result}")
         return result
 
     def get_latest_price_date(self, ticker: str) -> date | None:
         resp = (
-            self._client.table("price_history")
+            self._client.table("stock_price")
             .select("business_date")
             .eq("ticker", ticker)
             .order("business_date", desc=True)
@@ -104,10 +109,10 @@ class SupabaseClient:
             return
         for i in range(0, len(rows), 1000):
             chunk = rows[i : i + 1000]
-            self._client.table("price_history").upsert(
+            self._client.table("stock_price").upsert(
                 chunk, on_conflict="ticker,business_date"
             ).execute()
-        logger.info(f"Upserted {len(rows)} price_history rows")
+        logger.info(f"Upserted {len(rows)} stock_price rows")
 
     # ── Business Dates ────────────────────────────────────────
 
@@ -128,7 +133,6 @@ class SupabaseClient:
         if not business_dates:
             return
 
-        # Normalize to iso strings, dedupe
         normalized = set()
         for d in business_dates:
             if isinstance(d, (date, datetime)):
@@ -153,7 +157,7 @@ class SupabaseClient:
 
     def get_price_history(self, ticker: str, lookback_days: int) -> list[dict]:
         resp = (
-            self._client.table("price_history")
+            self._client.table("stock_price")
             .select("business_date, close, adj_close")
             .eq("ticker", ticker)
             .order("business_date", desc=True)
@@ -171,7 +175,7 @@ class SupabaseClient:
 
         while True:
             resp = (
-                self._client.table("price_history")
+                self._client.table("stock_price")
                 .select("business_date, close, adj_close")
                 .eq("ticker", ticker)
                 .order("business_date", desc=False)
@@ -188,7 +192,21 @@ class SupabaseClient:
         logger.info(f"  {ticker}: fetched {len(all_rows)} total price rows from Supabase")
         return all_rows
 
-    # ── Stock Volatility ─────────────────────────────────────
+    # ── Stock Returns ─────────────────────────────────────────
+
+    def upsert_stock_returns(self, rows: list[dict]) -> None:
+        """Upsert daily-return rows to stock_return table."""
+        if not rows:
+            return
+        for i in range(0, len(rows), 1000):
+            chunk = rows[i : i + 1000]
+            self._client.table("stock_return").upsert(
+                chunk,
+                on_conflict="ticker,business_date",
+            ).execute()
+        logger.info(f"Upserted {len(rows)} stock_return rows")
+
+    # ── Stock Volatility ──────────────────────────────────────
 
     def upsert_stock_volatility(self, rows: list[dict]) -> None:
         """Upsert per-stock volatility rows to stock_volatility table."""
@@ -207,42 +225,42 @@ class SupabaseClient:
         self._client.table("stock_volatility").delete().lt(
             "business_date", before_date
         ).execute()
-        
-    # ── VaR Calculations (precomputed) ────────────────────────
+
+    # ── Stock VaR ─────────────────────────────────────────────
 
     def upsert_var_calculations(self, rows: list[dict]) -> None:
         if not rows:
             return
         for i in range(0, len(rows), 1000):
             chunk = rows[i : i + 1000]
-            self._client.table("var_calculations_precomputed").upsert(
+            self._client.table("stock_var").upsert(
                 chunk,
                 on_conflict="ticker,business_date,confidence_level,lookback_days",
             ).execute()
-        logger.info(f"Upserted {len(rows)} var_calculations_precomputed rows")
+        logger.info(f"Upserted {len(rows)} stock_var rows")
 
     def delete_old_var(self, before_date: str) -> None:
-        self._client.table("var_calculations_precomputed").delete().lt(
+        self._client.table("stock_var").delete().lt(
             "business_date", before_date
         ).execute()
 
-    # ── Global Correlations ──────────────────────────────────
+    # ── Stock Correlations ────────────────────────────────────
 
     def upsert_global_correlations(self, rows: list[dict]) -> None:
-        """Upsert pairwise correlation rows to global_correlations."""
+        """Upsert pairwise correlation rows to stock_correlation."""
         if not rows:
             return
         for i in range(0, len(rows), 1000):
             chunk = rows[i : i + 1000]
-            self._client.table("global_correlations").upsert(
+            self._client.table("stock_correlation").upsert(
                 chunk,
                 on_conflict="ticker_a,ticker_b,period_days,business_date",
             ).execute()
-        logger.info(f"Upserted {len(rows)} global_correlations rows")
+        logger.info(f"Upserted {len(rows)} stock_correlation rows")
 
     def delete_old_correlations(self, before_date: str) -> None:
         """Delete correlation rows older than a given date."""
-        self._client.table("global_correlations").delete().lt(
+        self._client.table("stock_correlation").delete().lt(
             "business_date", before_date
         ).execute()
 

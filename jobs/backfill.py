@@ -3,12 +3,12 @@ Backfill Job — Polygon fetch and VaR computation.
 ========================================================
 
 METHOD NAMING CONVENTION:
-  fetch_and_compute_var_*  → calls Polygon API for prices, THEN computes VaR
-  compute_var_*            → computes VaR ONLY from existing Supabase data (NO Polygon)
+  fetch_and_compute_var_*  → calls Polygon API for prices, THEN computes returns/vol/corr/VaR
+  compute_var_*            → computes metrics ONLY from existing Supabase data (NO Polygon)
 
 TICKER RESOLUTION:
   Methods ending in "_all" resolve tickers by querying all distinct tickers
-  in the price_history table. This means any ticker you've uploaded price
+  in the stock_price table. This means any ticker you've uploaded price
   data for will automatically be included — no config changes needed.
 
   The seed_tickers in settings.py are NOT used here. They exist only for
@@ -16,7 +16,7 @@ TICKER RESOLUTION:
 """
 
 import logging
-from datetime import date, timedelta
+from datetime import timedelta
 
 from config.settings import Settings, safe_fetch_date
 from services.supabase_client import SupabaseClient
@@ -26,13 +26,23 @@ logger = logging.getLogger(__name__)
 
 
 class BackfillJob:
-    def __init__(self, supabase, price_client, var_engine, settings, correlation_engine=None, volatility_engine=None):
+    def __init__(
+        self,
+        supabase,
+        price_client,
+        var_engine,
+        settings,
+        correlation_engine=None,
+        volatility_engine=None,
+        return_engine=None,
+    ):
         self.supabase = supabase
         self.price_client = price_client
         self.var_engine = var_engine
         self.settings = settings
         self.correlation_engine = correlation_engine
         self.volatility_engine = volatility_engine
+        self.return_engine = return_engine
 
     # ══════════════════════════════════════════════════════════
     # FETCH + COMPUTE VAR (fetches price data via yfinance/Polygon)
@@ -40,15 +50,15 @@ class BackfillJob:
 
     async def fetch_and_compute_var(self, ticker: str):
         """
-        Fetch prices + compute VaR for ONE ticker.
+        Fetch prices + compute returns + vol + VaR for ONE ticker.
         CLI: python main.py --fetch-and-compute-var TSLA
 
         Steps:
           1. Fetch ~1000 days of daily bars (yfinance → Polygon fallback)
-          2. Upsert into price_history in Supabase
+          2. Upsert into stock_price in Supabase
           3. Read back full price history from Supabase
-          4. Compute rolling daily VaR
-          5. Upsert results into var_calculations_precomputed
+          4. Compute rolling daily returns + vol + VaR
+          5. Upsert results into stock_return / stock_volatility / stock_var
         """
         logger.info(f"[fetch-and-compute-var] {ticker}: starting...")
         today = safe_fetch_date()
@@ -83,18 +93,17 @@ class BackfillJob:
             logger.warning(f"  {ticker}: no data returned from any source")
             return
 
-        # ── Steps 3-5: Compute and store VaR ──
+        # ── Steps 3-5: Compute and store metrics ──
         await self.compute_var(ticker)
 
     async def fetch_and_compute_var_all(self):
         """
-        Fetch prices from Polygon + compute VaR for ALL tickers in price_history.
+        Fetch prices from Polygon + compute returns + vol + VaR for ALL
+        tickers in stock_price.
         CLI: python main.py --fetch-and-compute-var-all
-
-        Resolves tickers from: SELECT DISTINCT ticker FROM price_history
         """
         tickers = self.supabase.get_all_price_history_tickers()
-        logger.info(f"[fetch-and-compute-var-all] Processing {len(tickers)} tickers from price_history: {tickers}")
+        logger.info(f"[fetch-and-compute-var-all] Processing {len(tickers)} tickers from stock_price: {tickers}")
 
         for i, ticker in enumerate(tickers):
             logger.info(f"[{i+1}/{len(tickers)}] {ticker}")
@@ -103,24 +112,29 @@ class BackfillJob:
         logger.info(f"Fetch + VaR complete — {len(tickers)} tickers processed.")
 
     # ══════════════════════════════════════════════════════════
-    # COMPUTE VAR ONLY (NO Polygon calls)
+    # COMPUTE ONLY (NO Polygon calls)
+    # Order: return → vol → VaR (single-ticker; corr is cross-ticker)
     # ══════════════════════════════════════════════════════════
 
     async def compute_var(self, ticker: str):
         """
-        Compute VaR for ONE ticker from existing Supabase price data.
+        Compute returns + vol + VaR for ONE ticker from existing Supabase
+        price data.
         CLI: python main.py --compute-var TSLA
 
-        No Polygon calls — works purely from data already in price_history.
+        No Polygon calls — works purely from data already in stock_price.
         Use this after you've manually uploaded prices to Supabase.
-
-        Requires at least 254 rows (252 lookback + 2) in price_history
-        for the ticker, otherwise VaR cannot be computed.
         """
-        logger.info(f"[compute-var] {ticker}: computing rolling VaR...")
+        logger.info(f"[compute-var] {ticker}: computing returns + vol + VaR...")
 
-        # Read full price history from Supabase
         prices = self.supabase.get_full_price_history(ticker)
+
+        # ── Returns: only need ≥2 prices ──
+        if self.return_engine is not None and len(prices) >= 2:
+            return_rows = self.return_engine.compute_daily_returns(ticker=ticker, prices=prices)
+            if return_rows:
+                self.supabase.upsert_stock_returns(return_rows)
+                logger.info(f"  {ticker}: upserted {len(return_rows)} return rows")
 
         if len(prices) < self.settings.var_lookback_days + 2:
             logger.warning(
@@ -129,20 +143,7 @@ class BackfillJob:
             )
             return
 
-        # Compute rolling VaR
-        var_rows = self.var_engine.compute_rolling_var(
-            ticker=ticker,
-            prices=prices,
-            confidence_level=self.settings.var_confidence_level,
-            lookback_days=self.settings.var_lookback_days,
-        )
-
-        # Upsert into var_calculations_precomputed
-        if var_rows:
-            self.supabase.upsert_var_calculations(var_rows)
-            logger.info(f"  {ticker}: upserted {len(var_rows)} VaR rows")
-
-        # Also compute and store volatility (uses same price data)
+        # ── Volatility ──
         if self.volatility_engine is not None:
             vol_rows = self.volatility_engine.compute_rolling_volatility(
                 ticker=ticker,
@@ -153,16 +154,25 @@ class BackfillJob:
                 self.supabase.upsert_stock_volatility(vol_rows)
                 logger.info(f"  {ticker}: upserted {len(vol_rows)} volatility rows")
 
+        # ── VaR ──
+        var_rows = self.var_engine.compute_rolling_var(
+            ticker=ticker,
+            prices=prices,
+            confidence_level=self.settings.var_confidence_level,
+            lookback_days=self.settings.var_lookback_days,
+        )
+        if var_rows:
+            self.supabase.upsert_var_calculations(var_rows)
+            logger.info(f"  {ticker}: upserted {len(var_rows)} VaR rows")
+
     async def compute_var_all(self):
         """
-        Compute VaR for ALL tickers that have price data in Supabase.
+        Compute returns + vol + VaR for ALL tickers that have price data
+        in Supabase.
         CLI: python main.py --compute-var-all
-
-        No Polygon calls — works purely from existing data.
-        Resolves tickers from: SELECT DISTINCT ticker FROM price_history
         """
         tickers = self.supabase.get_all_price_history_tickers()
-        logger.info(f"[compute-var-all] Processing {len(tickers)} tickers from price_history: {tickers}")
+        logger.info(f"[compute-var-all] Processing {len(tickers)} tickers from stock_price: {tickers}")
 
         for i, ticker in enumerate(tickers):
             logger.info(f"[{i+1}/{len(tickers)}] {ticker}")
@@ -171,25 +181,90 @@ class BackfillJob:
         logger.info(f"VaR computation complete — {len(tickers)} tickers processed.")
 
     # ══════════════════════════════════════════════════════════
+    # COMPUTE RETURNS ONLY (NO Polygon calls)
+    # ══════════════════════════════════════════════════════════
+
+    async def compute_returns_all(self):
+        """
+        Compute daily returns for ALL tickers in stock_price.
+        CLI: python main.py --compute-returns-all
+
+        No Polygon calls — works purely from existing data.
+        """
+        if self.return_engine is None:
+            logger.error("ReturnEngine not provided — cannot compute returns")
+            return
+
+        tickers = self.supabase.get_all_price_history_tickers()
+        logger.info(f"[compute-returns-all] Processing {len(tickers)} tickers from stock_price: {tickers}")
+
+        for i, ticker in enumerate(tickers):
+            logger.info(f"[{i+1}/{len(tickers)}] {ticker}")
+            prices = self.supabase.get_full_price_history(ticker)
+
+            if len(prices) < 2:
+                logger.warning(f"  {ticker}: only {len(prices)} prices — skipping returns")
+                continue
+
+            rows = self.return_engine.compute_daily_returns(ticker=ticker, prices=prices)
+            if rows:
+                self.supabase.upsert_stock_returns(rows)
+
+        logger.info(f"Return computation complete — {len(tickers)} tickers processed.")
+
+    # ══════════════════════════════════════════════════════════
+    # COMPUTE VOLATILITY ONLY (NO Polygon calls)
+    # ══════════════════════════════════════════════════════════
+
+    async def compute_volatility_all(self):
+        """
+        Compute rolling volatility for ALL tickers in stock_price.
+        CLI: python main.py --compute-volatility-all
+        """
+        if self.volatility_engine is None:
+            logger.error("VolatilityEngine not provided — cannot compute volatility")
+            return
+
+        tickers = self.supabase.get_all_price_history_tickers()
+        logger.info(f"[compute-volatility-all] Processing {len(tickers)} tickers from stock_price: {tickers}")
+
+        for i, ticker in enumerate(tickers):
+            logger.info(f"[{i+1}/{len(tickers)}] {ticker}")
+            prices = self.supabase.get_full_price_history(ticker)
+
+            if len(prices) < self.settings.var_lookback_days + 2:
+                logger.warning(
+                    f"  {ticker}: insufficient data for volatility "
+                    f"({len(prices)} rows, need {self.settings.var_lookback_days + 2})"
+                )
+                continue
+
+            vol_rows = self.volatility_engine.compute_rolling_volatility(
+                ticker=ticker,
+                prices=prices,
+                lookback_days=self.settings.var_lookback_days,
+            )
+            if vol_rows:
+                self.supabase.upsert_stock_volatility(vol_rows)
+
+        logger.info(f"Volatility computation complete — {len(tickers)} tickers processed.")
+
+    # ══════════════════════════════════════════════════════════
     # COMPUTE CORRELATIONS ONLY (NO Polygon calls)
     # ══════════════════════════════════════════════════════════
 
     async def compute_correlations_all(self):
         """
-        Compute rolling pairwise correlations for ALL tickers in price_history.
+        Compute rolling pairwise correlations for ALL tickers in stock_price.
         CLI: python main.py --compute-correlations-all
-
-        No Polygon calls — works purely from existing data.
-        Resolves tickers from: SELECT DISTINCT ticker FROM price_history
         """
         if self.correlation_engine is None:
             logger.error("CorrelationEngine not provided — cannot compute correlations")
             return
 
         tickers = self.supabase.get_all_price_history_tickers()
-        logger.info(f"[compute-correlations-all] Processing {len(tickers)} tickers from price_history: {tickers}")
+        logger.info(f"[compute-correlations-all] Processing {len(tickers)} tickers from stock_price: {tickers}")
 
-        # Load all price histories
         min_prices_needed = int(
             min(self.settings.correlation_lookback_periods)
             * self.settings.correlation_min_overlap_pct
@@ -220,43 +295,3 @@ class BackfillJob:
                 self.supabase.upsert_global_correlations(corr_rows)
 
         logger.info(f"Correlation computation complete — {len(all_prices)} tickers processed.")
-
-    # ══════════════════════════════════════════════════════════
-    # COMPUTE VOLATILITY ONLY (NO Polygon calls)
-    # ══════════════════════════════════════════════════════════
-
-    async def compute_volatility_all(self):
-        """
-        Compute rolling volatility for ALL tickers in price_history.
-        CLI: python main.py --compute-volatility-all
-
-        No Polygon calls — works purely from existing data.
-        Resolves tickers from: SELECT DISTINCT ticker FROM price_history
-        """
-        if self.volatility_engine is None:
-            logger.error("VolatilityEngine not provided — cannot compute volatility")
-            return
-
-        tickers = self.supabase.get_all_price_history_tickers()
-        logger.info(f"[compute-volatility-all] Processing {len(tickers)} tickers from price_history: {tickers}")
-
-        for i, ticker in enumerate(tickers):
-            logger.info(f"[{i+1}/{len(tickers)}] {ticker}")
-            prices = self.supabase.get_full_price_history(ticker)
-
-            if len(prices) < self.settings.var_lookback_days + 2:
-                logger.warning(
-                    f"  {ticker}: insufficient data for volatility "
-                    f"({len(prices)} rows, need {self.settings.var_lookback_days + 2})"
-                )
-                continue
-
-            vol_rows = self.volatility_engine.compute_rolling_volatility(
-                ticker=ticker,
-                prices=prices,
-                lookback_days=self.settings.var_lookback_days,
-            )
-            if vol_rows:
-                self.supabase.upsert_stock_volatility(vol_rows)
-
-        logger.info(f"Volatility computation complete — {len(tickers)} tickers processed.")
